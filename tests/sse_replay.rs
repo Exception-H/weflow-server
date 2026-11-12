@@ -56,6 +56,8 @@ fn bare_state(dir: &std::path::Path) -> (Arc<server::AppState>, std::path::PathB
         media_export_dir: dir.join("api-media"),
         base_url: None,
         show_token: false,
+        index_scope: Default::default(),
+        keys_file: None,
         data_dir: dir.join("data"),
     };
     let state = Arc::new(server::AppState::new(cfg, TOKEN.to_string(), shutdown_tx));

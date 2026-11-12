@@ -28,6 +28,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Print the stored API token (from the OS credential store) and exit.
     pub show_token: bool,
+    /// Optional filtered and bounded message index.
+    pub index_scope: crate::store::IndexScope,
+    /// External registration JSON whose `keys` map may be refreshed without rebuilding history.
+    pub keys_file: Option<PathBuf>,
 }
 
 /// Resolve the per-platform application data directory.
@@ -66,6 +70,8 @@ impl Default for Config {
             base_url: None,
             data_dir: dir,
             show_token: false,
+            index_scope: Default::default(),
+            keys_file: None,
         }
     }
 }
@@ -165,6 +171,18 @@ pub fn parse_args(args: Vec<String>) -> anyhow::Result<Option<Config>> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("--watch-fallback-ms 需为非负整数: {value}"))?
             }
+            "--watch-session" => {
+                if !value.ends_with("@chatroom") || value.chars().any(char::is_whitespace) {
+                    anyhow::bail!("--watch-session 需为完整群编号（以 @chatroom 结尾）");
+                }
+                if !cfg.index_scope.sessions.contains(&value) { cfg.index_scope.sessions.push(value); }
+            }
+            "--messages-per-session" => {
+                let limit: usize = value.parse().map_err(|_| anyhow::anyhow!("--messages-per-session 需为正整数"))?;
+                if limit == 0 || limit > 100_000 { anyhow::bail!("--messages-per-session 需为 1..100000"); }
+                cfg.index_scope.messages_per_session = Some(limit);
+            }
+            "--keys-file" => cfg.keys_file = Some(PathBuf::from(value)),
             "--media-export-dir" => cfg.media_export_dir = PathBuf::from(value),
             "--base-url" => cfg.base_url = Some(value),
             other => anyhow::bail!("未知参数: {other}"),
@@ -188,6 +206,9 @@ fn print_help() {
          \x20   --watch-fallback-ms <MS>   慢速兜底轮询，0 关闭（默认 30000）\n\
          \x20   --media-export-dir <DIR>   媒体导出根目录\n\
          \x20   --base-url <URL>           媒体导出链接 base URL\n\
+         \x20   --watch-session <ID>       只索引此群，可重复；省略则索引全部会话\n\
+         \x20   --messages-per-session <N> 每会话最多保留 N 条近期消息；省略则不限制\n\
+         \x20   --keys-file <PATH>         从外部注册 JSON 刷新 keys 映射（不提取密钥）\n\
          \x20   --show-token               打印已存的 API token 并退出\n\
          \x20   -h, --help                 显示本帮助\n\
          \x20   -V, --version              打印版本号",
@@ -287,6 +308,18 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn scoped_flags_are_explicit_and_reject_empty_or_excessive_windows() {
+        let cfg = parse_args(args(&["--watch-session", "example@chatroom", "--watch-session=example@chatroom",
+            "--messages-per-session", "200", "--keys-file", "/example/registration.json"])).unwrap().unwrap();
+        assert_eq!(cfg.index_scope.sessions, vec!["example@chatroom"]);
+        assert_eq!(cfg.index_scope.messages_per_session, Some(200));
+        assert!(cfg.keys_file.is_some());
+        assert!(parse_args(args(&["--messages-per-session", "0"])).is_err());
+        assert!(parse_args(args(&["--messages-per-session", "18446744073709551615"])).is_err());
+        assert!(parse_args(args(&["--watch-session", "not-a-group"])).is_err());
     }
 
     #[test]

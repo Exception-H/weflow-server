@@ -795,6 +795,7 @@ pub fn register_account(
         store.clone(),
         state.bus.clone(),
     )));
+    sync.lock().configure(state.cfg.index_scope.clone(), state.cfg.keys_file.clone());
     // No second owner of `sync` yet, so this lock cannot contend. Both handles are
     // `Arc`s out of the sync engine: `stopped` lets deregistration skip in-flight
     // writes, `progress` lets HTTP read the build's position — neither may take
@@ -1146,6 +1147,8 @@ mod tests {
             base_url: None,
             data_dir: std::path::PathBuf::from("target/test-tmp/state-data"),
             show_token: false,
+            index_scope: Default::default(),
+            keys_file: None,
         };
         let (shutdown, _) = tokio::sync::watch::channel(false);
         Arc::new(AppState::new(cfg, "0123456789abcdef".into(), shutdown))

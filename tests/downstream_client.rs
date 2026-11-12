@@ -150,6 +150,8 @@ fn build_real_app(export_dir: &std::path::Path) -> Option<(axum::Router, Arc<App
         media_export_dir: export_dir.join("media"),
         base_url: None,
         show_token: false,
+        index_scope: Default::default(),
+        keys_file: None,
         data_dir: export_dir.join("data"),
     };
     let state = Arc::new(AppState::new(cfg, TEST_TOKEN.to_string(), shutdown_tx));

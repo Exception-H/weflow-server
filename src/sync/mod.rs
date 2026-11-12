@@ -211,6 +211,10 @@ pub struct AccountSync {
     /// 与 `stopped` 同族的理由：它必须能在 `full_sync` 持锁期间被 HTTP 侧读到，
     /// 所以复制的是 `Arc`，不是值；读侧永远不碰这把锁。
     progress: Arc<index::IndexProgress>,
+    scope: crate::store::IndexScope,
+    keys_file: Option<PathBuf>,
+    keys_stamp: Option<(std::time::SystemTime, u64)>,
+    poll_cursor: usize,
 }
 
 /// 单轮排空的页数上限：防坏数据（水位推不动的表）把一轮 poll 拖死。
@@ -239,6 +243,10 @@ impl AccountSync {
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(index::IndexProgress::default()),
+            scope: Default::default(),
+            keys_file: None,
+            keys_stamp: None,
+            poll_cursor: 0,
         }
     }
 
@@ -262,6 +270,53 @@ impl AccountSync {
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(index::IndexProgress::default()),
+            scope: Default::default(),
+            keys_file: None,
+            keys_stamp: None,
+            poll_cursor: 0,
+        }
+    }
+
+    /// Configure the index before the initial sync; existing library callers remain unfiltered.
+    pub fn configure(&mut self, scope: crate::store::IndexScope, keys_file: Option<PathBuf>) {
+        self.scope = scope;
+        self.keys_file = keys_file;
+    }
+
+    fn refresh_keys(&mut self) {
+        let Some(path) = &self.keys_file else { return };
+        let stamp = std::fs::metadata(path).and_then(|meta| Ok((meta.modified()?, meta.len())));
+        let Ok(stamp) = stamp else { return };
+        if self.keys_stamp == Some(stamp) { return; }
+        // Remember even malformed revisions: a corrected file will change the stamp and retry.
+        self.keys_stamp = Some(stamp);
+        let parsed = (|| -> Result<KeyMap> {
+            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            if value.get("wxid").and_then(|v| v.as_str()) != Some(self.wxid.as_str()) {
+                anyhow::bail!("external registration belongs to another account");
+            }
+            let source = value.get("db_path").and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("registration JSON requires db_path"))?;
+            if std::fs::canonicalize(source)? != std::fs::canonicalize(&self.storage)? {
+                anyhow::bail!("external registration belongs to another storage directory");
+            }
+            let map = value.get("keys").ok_or_else(|| anyhow::anyhow!("registration JSON requires keys"))?;
+            KeyMap::from_parts(None, Some(serde_json::from_value(map.clone())?))
+        })();
+        match parsed {
+            Ok(keys) if !keys.is_empty() => {
+                for file in &self.last_files {
+                    if self.keys.key_for(&file.rel) != keys.key_for(&file.rel) {
+                        self.pool.close(&file.rel);
+                        self.stamps.remove(&file.rel);
+                    }
+                }
+                self.keys = keys;
+                // Close only changed-key connections when next acquired, retaining all watermarks.
+                tracing::info!("reloaded externally supplied database keys");
+            }
+            Ok(_) => tracing::warn!("empty external key map ignored"),
+            Err(_) => tracing::warn!("external key map unreadable or invalid; keeping registered keys"),
         }
     }
 
@@ -313,9 +368,10 @@ impl AccountSync {
     /// Full build: read every database through the live pool and rebuild the
     /// index from scratch. Returns the number of databases processed.
     pub fn full_sync(&mut self) -> Result<usize> {
+        self.refresh_keys();
         let files = self.rescan();
         let keys = self.keys.clone();
-        let store = index::build_all_live(&mut self.pool, &keys, &self.wxid, &files, &self.progress)?;
+        let store = index::build_scoped_live(&mut self.pool, &keys, &self.wxid, &files, &self.progress, &self.scope)?;
         // A build on a real account runs for minutes; a deregistration in that
         // window already cleared the store, so installing this index would
         // resurrect it. The caller checks the same flag before flipping to
@@ -391,7 +447,8 @@ impl AccountSync {
             match f.kind {
                 DbKind::Message => work.push(Work::Messages(f.clone())),
                 DbKind::Session => work.push(Work::Sessions(f.clone())),
-                DbKind::Sns => work.push(Work::Sns(f.clone())),
+                DbKind::Sns if self.scope.sessions.is_empty() => work.push(Work::Sns(f.clone())),
+                DbKind::Sns => {},
                 DbKind::Contact => work.push(Work::Contacts(f.clone())),
                 // 群元数据也要跟着变：名片住在 fts 库里，名册/群主住在 contact.db 里。
                 // 单独一类是必要的 —— 原来 fts 库被归为 `Contact`，于是「名片变了」会去
@@ -410,15 +467,24 @@ impl AccountSync {
         if self.is_stopped() {
             return Ok((0, 0));
         }
-        let work = self.classify_changed();
+        self.refresh_keys();
+        let mut work = self.classify_changed();
         if work.is_empty() {
             return Ok((0, 0));
+        }
+        if self.scope.messages_per_session.is_some() {
+            let offset = self.poll_cursor % work.len();
+            work.rotate_left(offset);
+            self.poll_cursor = self.poll_cursor.wrapping_add(1);
         }
 
         // phase 1: incremental reads (read-only wrt the store)
         let mut new_rows: Vec<(String, MessageRecord)> = Vec::new();
         let mut new_watermarks: Vec<(String, Watermark)> = Vec::new();
         let mut revoke_rows: Vec<(String, MessageRecord)> = Vec::new();
+        // In bounded mode drain at most one normal page across the whole account per poll.
+        // Unread files keep their old baseline and are picked up by the next poll.
+        let row_budget = if self.scope.messages_per_session.is_some() { index::READ_PAGE } else { usize::MAX };
         // 本轮**真正读过数据**的文件：只有它们才允许在 phase 4 记账
         // （戳与 data_version 基线）。读失败/无 key/打开失败的文件不记账，
         // 下一轮 classify 才会把它再当「已变更」重查。
@@ -438,7 +504,7 @@ impl AccountSync {
                             // 高频触发会让坏 key 的文件拖垮整个 poll 节奏。
                             // 瞬时 Io 失败（下一分支）保持逐轮重试 —— 那类失败
                             // 不记戳，天然就是「下一轮重查」。
-                            tracing::warn!("live open failed for {} (wrong key?)", f.rel);
+                            // LivePool reports the first failed key/header combination only.
                             self.pool.mark_keyless(&f.rel);
                             continue;
                         }
@@ -454,6 +520,7 @@ impl AccountSync {
                     // （回归：single_commit_larger_than_page_is_fully_drained）
                     let mut drained_all = true;
                     for (table, md5_suffix) in index::message_tables(conn) {
+                        if !self.scope.allows_table(&md5_suffix) { continue; }
                         let wm_key = format!("{}:{table}", f.rel);
                         let mut wm = {
                             let guard = self.store.read();
@@ -461,13 +528,18 @@ impl AccountSync {
                         };
                         let mut pages = 0usize;
                         loop {
+                            if new_rows.len() + revoke_rows.len() >= row_budget {
+                                drained_all = false;
+                                break;
+                            }
                             pages += 1;
                             let rows = read_new(conn, &table, &wm, name2id.as_deref())?;
                             let full = rows.len() >= index::READ_PAGE;
                             for row in rows {
                                 let session_username = {
                                     let guard = self.store.read();
-                                    index::resolve_table_session(&guard, &md5_suffix)
+                                    self.scope.session_for_table(&md5_suffix).map(str::to_owned)
+                                        .unwrap_or_else(|| index::resolve_table_session(&guard, &md5_suffix))
                                 };
                                 // 外层游标随每一行推进：下一轮排空从这里续读。
                                 wm = Watermark {
@@ -629,6 +701,11 @@ impl AccountSync {
                 };
                 self.bus.publish(Event::Revoke(ev));
             }
+        }
+
+        {
+            let mut guard = self.store.write();
+            self.scope.trim(&mut guard);
         }
 
         // phase 3: dependent section reloads over warm live connections

@@ -35,6 +35,8 @@ fn test_cfg(dir: &std::path::Path, port: u16) -> Config {
         media_export_dir: dir.join("media"),
         base_url: None,
         show_token: false,
+        index_scope: Default::default(),
+        keys_file: None,
         data_dir: dir.join("data"),
     }
 }

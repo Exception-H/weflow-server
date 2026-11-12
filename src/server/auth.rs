@@ -97,6 +97,8 @@ mod tests {
             base_url: None,
             data_dir: std::path::PathBuf::from("target/test-tmp/auth-data"),
             show_token: false,
+            index_scope: Default::default(),
+            keys_file: None,
         };
         let (shutdown, _) = tokio::sync::watch::channel(false);
         Arc::new(AppState::new(cfg, "0123456789abcdef".to_string(), shutdown))

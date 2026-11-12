@@ -64,7 +64,11 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 - ✅ 密钥：**仅 API 注册**（不读取微信进程）：`POST /api/v1/accounts` 传 64-hex 密钥
   （每库独立 key 或统一 key）；密钥仅内存，重启后需重新注册。
 - ✅ 数据读取：session.db（会话）/ message_*.db（`Msg_<md5>` 消息表 + Name2Id 反查）/ contact.db
-  全量建内存索引，时间窗口水位增量同步。
+  默认全量建内存索引，时间窗口水位增量同步。Fork 增加可选 `--watch-session`（可重复）、
+  `--messages-per-session`（1..100000）：只索引选定群并保留近期窗口，减少常驻历史。
+  限定模式下查询/搜索/导出不代表源库全历史，具体边界见 [API 文档](docs/weflow-server-api.md#指定群与有限历史模式fork-可选扩展)。
+- ✅ Fork 外部密钥刷新：`--keys-file` 消费同账号注册 JSON 的修订，关闭密钥变更的旧连接；
+  可选 `scripts/refresh-registration-keys.py` 在外部派生和只读核验，不向服务传入口令。
 - ✅ 实时监控：notify 监听 `db_storage`，防抖 350ms，慢速兜底轮询 30s；撤回检测。
 - ✅ 服务封装：axum HTTP + SSE（health/accounts/messages/sessions/contacts/group-members/
   media/push/sync），另含 SNS 只读全套；默认端口 **5033**（WeFlow 5031、qqflow-server 5032）。

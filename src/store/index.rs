@@ -506,6 +506,7 @@ fn load_uid_map(conn: &Connection, name2id: Option<&str>) -> std::collections::H
 
 /// Read all rows of one message table (in order), returning owned records and
 /// the table watermark. Sender names are resolved via `contacts`.
+#[cfg(test)]
 fn load_message_table(
     conn: &Connection,
     table: &str,
@@ -514,17 +515,35 @@ fn load_message_table(
     my_wxid: &str,
     progress: &IndexProgress,
 ) -> Result<(Vec<MessageRecord>, Watermark)> {
+    load_message_table_limited(conn, table, uid_map, contacts, my_wxid, progress, None)
+}
+
+fn load_message_table_limited(
+    conn: &Connection,
+    table: &str,
+    uid_map: &std::collections::HashMap<i64, String>,
+    contacts: &std::collections::HashMap<String, Contact>,
+    my_wxid: &str,
+    progress: &IndexProgress,
+    limit: Option<usize>,
+) -> Result<(Vec<MessageRecord>, Watermark)> {
     let cols = MsgCols::probe(conn, table).ok_or_else(|| anyhow::anyhow!("no local_id column"))?;
     let order = [
         cols.time.as_deref().unwrap_or(&cols.local),
         cols.seq.as_deref().unwrap_or(&cols.local),
         &cols.local,
     ];
-    let query = format!(
-        "SELECT {sel} FROM \"{table}\" ORDER BY {ord}",
-        sel = cols.selected.join(", "),
-        ord = order.join(", "),
-    );
+    // Select the tail in SQL, then restore ascending order before parsing and watermarking.
+    let query = if let Some(limit) = limit {
+        format!(
+            "SELECT {sel} FROM (SELECT {sel} FROM \"{table}\" ORDER BY {desc} LIMIT {limit}) ORDER BY {ord}",
+            sel = cols.selected.join(", "),
+            desc = order.iter().map(|column| format!("{column} DESC")).collect::<Vec<_>>().join(", "),
+            ord = order.join(", "),
+        )
+    } else {
+        format!("SELECT {sel} FROM \"{table}\" ORDER BY {ord}", sel = cols.selected.join(", "), ord = order.join(", "))
+    };
     let mut stmt = conn.prepare(&query)?;
     let mut rows = stmt.query([])?;
     let mut records = Vec::new();
@@ -639,7 +658,23 @@ pub fn build_all_live(
     db_files: &[DbFile],
     progress: &IndexProgress,
 ) -> Result<Store> {
-    let mut store = build_all_live_inner(pool, keys, my_wxid, db_files, progress)?;
+    build_scoped_live(pool, keys, my_wxid, db_files, progress, &super::IndexScope::default())
+}
+
+/// Build a bounded index without reading excluded conversations' message bodies.
+pub fn build_scoped_live(
+    pool: &mut LivePool,
+    keys: &KeyMap,
+    my_wxid: &str,
+    db_files: &[DbFile],
+    progress: &IndexProgress,
+    scope: &super::IndexScope,
+) -> Result<Store> {
+    if scope.messages_per_session.is_some_and(|limit| limit == 0 || limit > 100_000) {
+        anyhow::bail!("messages_per_session must be in 1..100000");
+    }
+    let mut store = build_all_live_inner(pool, keys, my_wxid, db_files, progress, scope)?;
+    scope.trim(&mut store);
     // 时刻在**外层**记：内层有多条提前返回的路径（缺密钥、库打不开），漏掉任何一条都会让
     // updatedAt 停在 0 —— 那种「字段在、值是零」比字段缺失更难查。
     store.mark_index_built();
@@ -652,6 +687,7 @@ fn build_all_live_inner(
     my_wxid: &str,
     db_files: &[DbFile],
     progress: &IndexProgress,
+    scope: &super::IndexScope,
 ) -> Result<Store> {
     let mut store = Store {
         my_wxid: my_wxid.to_string(),
@@ -723,7 +759,7 @@ fn build_all_live_inner(
             continue;
         };
         if let Ok(conn) = pool.get_or_open(f, key) {
-            total_tables += message_tables(conn).len();
+            total_tables += message_tables(conn).iter().filter(|(_, suffix)| scope.allows_table(suffix)).count();
         }
     }
     progress.set_tables_total(total_tables);
@@ -753,11 +789,14 @@ fn build_all_live_inner(
         };
         let uid_map = load_uid_map(conn, name2id_table(conn).as_deref());
         for (table, md5_suffix) in message_tables(conn) {
-            match load_message_table(conn, &table, &uid_map, &contacts, my_wxid, progress) {
+            if !scope.allows_table(&md5_suffix) { continue; }
+            match load_message_table_limited(conn, &table, &uid_map, &contacts, my_wxid, progress, scope.messages_per_session) {
                 Ok((records, watermark)) => {
-                    let session = table_session(&md5_suffix, &store);
+                    let session = scope.session_for_table(&md5_suffix).map(str::to_owned)
+                        .unwrap_or_else(|| table_session(&md5_suffix, &store));
                     let conv = store.convs.entry(session).or_default();
                     conv.extend(records);
+                    scope.trim(&mut store);
                     let current = store
                         .watermarks
                         .get(&format!("{}:{table}", f.rel))
@@ -776,8 +815,11 @@ fn build_all_live_inner(
         }
     }
 
+    // A group-only watcher has no use for the account's unrelated Moments history.
     // 4) sns.db — moments timeline
-    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Sns) {
+    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Sns)
+        && scope.sessions.is_empty()
+    {
         let Some(key) = keys.key_for(&f.rel) else {
             tracing::warn!("no key for {}", f.rel);
             return Ok(store);

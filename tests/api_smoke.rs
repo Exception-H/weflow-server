@@ -71,6 +71,8 @@ fn test_state_inner(
         media_export_dir: dir.join("api-media"),
         base_url: None,
         show_token: false,
+        index_scope: Default::default(),
+        keys_file: None,
         data_dir: dir.join("data"),
     };
     // State first: the event bus lives there and the sync engine publishes onto
@@ -162,6 +164,8 @@ async fn sse_has_no_readiness_gate_but_business_endpoints_do() {
             media_export_dir: dir.join("api-media"),
             base_url: None,
             show_token: false,
+            index_scope: Default::default(),
+            keys_file: None,
             data_dir: dir.join("data"),
         },
         TOKEN.to_string(),
@@ -1725,6 +1729,8 @@ fn register_account_is_idempotent_at_registry_level() {
             media_export_dir: dir.join("api-media"),
             base_url: None,
             show_token: false,
+            index_scope: Default::default(),
+            keys_file: None,
             data_dir: dir.join("data"),
         },
         TOKEN.to_string(),

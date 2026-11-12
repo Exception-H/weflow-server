@@ -9,6 +9,49 @@ use std::collections::HashMap;
 
 use crate::parser::ParsedMsg;
 
+/// Optional bounded message index. Empty sessions and no limit preserve full indexing.
+#[derive(Debug, Clone, Default)]
+pub struct IndexScope {
+    /// Exact session usernames to index; an empty list allows every session.
+    pub sessions: Vec<String>,
+    /// Maximum retained messages per session, including all database shards.
+    pub messages_per_session: Option<usize>,
+}
+
+impl IndexScope {
+    /// Match table names before reading their message bodies.
+    pub fn allows_table(&self, suffix: &str) -> bool {
+        self.sessions.is_empty() || self.sessions.iter().any(|session| {
+            {
+                use md5::Digest;
+                format!("{:x}", md5::Md5::digest(session.as_bytes()))
+            }.eq_ignore_ascii_case(suffix)
+        })
+    }
+
+    /// Recover the exact configured username even if the session summary has not been written yet.
+    pub fn session_for_table(&self, suffix: &str) -> Option<&str> {
+        self.sessions.iter().find(|session| {
+            {
+                use md5::Digest;
+                format!("{:x}", md5::Md5::digest(session.as_bytes()))
+            }.eq_ignore_ascii_case(suffix)
+        }).map(String::as_str)
+    }
+
+    /// Drop old messages without changing incremental watermarks or emitted events.
+    pub fn trim(&self, store: &mut Store) {
+        let Some(limit) = self.messages_per_session else { return };
+        for messages in store.convs.values_mut() {
+            if messages.len() <= limit { continue; }
+            messages.sort_by_key(|row| (row.create_time, row.sort_seq, row.local_id));
+            messages.drain(..messages.len() - limit);
+            // A rare large commit must not leave its peak allocation resident indefinitely.
+            if messages.capacity() > limit.saturating_mul(2) { messages.shrink_to_fit(); }
+        }
+    }
+}
+
 /// Session/contact kind classification by username conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]

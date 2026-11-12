@@ -1169,7 +1169,38 @@ weflow-server.exe sessions --json        # 子命令面
 ```
 
 参数：`--show-token`、`--port`、`--host`、`--log`、`--log-format`、`--watch-debounce-ms`、
-`--watch-fallback-ms`、`--media-export-dir`、`--base-url`（全部仅命令行，无配置文件）。
+`--watch-fallback-ms`、`--media-export-dir`、`--base-url`、`--watch-session`、
+`--messages-per-session`、`--keys-file`（服务开关由命令行提供；keys-file 只读取外部注册密钥映射）。
+
+### 指定群与有限历史模式（Fork 可选扩展）
+
+默认不传新参数，维持原有全量索引与查询行为。
+
+```sh
+weflow-server --watch-session GROUP_A@chatroom --watch-session GROUP_B@chatroom \
+  --messages-per-session 200 --keys-file /absolute/path/registration.json
+```
+
+- `--watch-session ID` 可重复，仅接收完整群编号；在首次扫描和增量读取时按消息表 MD5
+  过滤，未选中的群不读取正文、不生成消息事件。会话/联系人名册仍可列出未选群，
+  因而已知但未索引的群可以返回空消息页；不把这视为源库没有消息。此模式不加载朋友圈。
+- `--messages-per-session N` 的范围为 1..100000，省略表示不限制。首次查询在 SQL 层取每分片
+  最新 N 条，再按群合并保留最新 N 条；增量消息先发布事件再裁剪。水位独立保存，裁剪不会
+  重新广播旧消息。有界模式单轮累计达到一页就停止领取新页（最后一页使总量最多接近两页），余量在后续轮次继续排空。
+- 下面各节默认描述全量模式。启用窗口后，消息数、搜索、时间范围、Pull 游标、分页、
+  群成员发言数及导出只覆盖当前保留窗口；`hasMore=false` 不代表源库历史全部读完。
+  `since=0`、手动 sync、CLI/MCP 查询也不会绕过窗口。此模式不适合做全历史备份。
+- `--keys-file PATH` 必须为当前账号的注册 JSON（`wxid`、`db_path`、非空 `keys` 映射）；
+  必须与绑定账号和规范化数据目录相符。文件修订后只刷新该映射并关闭变更密钥的连接，
+  保留消息水位；图片密钥不在热刷新范围，需要重新注册更新。无效修订保留原密钥，
+  同一修订仅告警一次。服务不派生或持久化数据库密钥，也不读取微信进程。
+- 可选的 `scripts/refresh-registration-keys.py` 由外部运维运行，依赖 `sqlcipher3`；读取既有
+  口令文件，检测已注册数据库的 16 字节头变化及新建的编号消息分片，重新派生并以只读连接核验后原子更新注册
+  JSON（权限 0600）。服务只消费该文件。启动参数分别为 `--registration`、
+  `--passphrase-file`、`--watch-seconds 5`；不要把口令或密钥写进参数、输出或仓库。
+  不再使用的旧库应从注册映射移除，不通过关闭校验来忽略故障。该辅助进程只允许单实例写同一文件。
+- 此扩展没有按需回读被裁剪历史的端点；需要超过窗口的材料时，应在部署前扩大 N。
+  数据库被整体替换且水位回退时仍需手动 full sync；盐变化不会自动重放全库历史。
 数据目录不可配置：Windows `%LOCALAPPDATA%\weflow-server`；媒体导出默认落在其下的
 `api-media`，仅 `--media-export-dir` 可改。
 

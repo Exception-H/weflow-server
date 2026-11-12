@@ -15,6 +15,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::io::Read;
+
+fn header_salt(path: &Path) -> Option<[u8; 16]> {
+    let mut salt = [0u8; 16];
+    std::fs::File::open(path).ok()?.read_exact(&mut salt).ok()?;
+    Some(salt)
+}
 
 use rusqlite::Connection;
 
@@ -104,11 +111,12 @@ pub struct LiveDb {
     /// (`None` whenever `conn` is `None`). `None` also means "no baseline —
     /// treat the file as changed".
     data_version: Option<i64>,
+    salt: Option<[u8; 16]>,
 }
 
 impl LiveDb {
     pub fn new(rel: impl Into<String>, path: PathBuf, key_hex64: impl Into<String>) -> Self {
-        Self { rel: rel.into(), path, key_hex64: key_hex64.into(), conn: None, data_version: None }
+        Self { rel: rel.into(), path, key_hex64: key_hex64.into(), conn: None, data_version: None, salt: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -120,7 +128,9 @@ impl LiveDb {
     }
 
     pub fn set_key_hex64(&mut self, hex64: impl Into<String>) {
-        self.key_hex64 = hex64.into();
+        let key = hex64.into();
+        if key != self.key_hex64 { self.close(); }
+        self.key_hex64 = key;
     }
 
     pub fn stored_key(&self) -> &str {
@@ -130,6 +140,7 @@ impl LiveDb {
     /// Open (or reopen) the connection. Verifies the key eagerly by touching
     /// sqlite_master so wrong-key failures surface as `WrongKey`.
     pub fn open(&mut self) -> Result<(), AcquireError> {
+        self.salt = header_salt(&self.path);
         let conn = open_read_only(&self.path, &self.key_hex64)?;
         self.data_version = Self::read_data_version(&conn).ok();
         self.conn = Some(conn);
@@ -145,6 +156,7 @@ impl LiveDb {
 
     /// Connection, reopening transparently when previously closed.
     pub fn acquire(&mut self) -> Result<&Connection, AcquireError> {
+        if self.salt != header_salt(&self.path) { self.close(); }
         if self.conn.is_none() {
             self.open()?;
         }
@@ -198,7 +210,7 @@ impl LivePool {
             let unchanged = self
                 .pool
                 .get(&f.rel)
-                .is_none_or(|e| !e.is_open() && e.stored_key() == incoming);
+                .is_none_or(|e| !e.is_open() && e.stored_key() == incoming && e.salt == header_salt(&f.abs));
             if unchanged {
                 return Err(AcquireError::WrongKey);
             }
@@ -209,7 +221,13 @@ impl LivePool {
         });
         // keep the stored raw key in sync if registration changed it
         entry.set_key_hex64(incoming);
-        entry.acquire()
+        if let Err(error) = entry.acquire() {
+            if matches!(&error, AcquireError::WrongKey) && self.keyless.insert(f.rel.clone()) {
+                tracing::warn!("database key unavailable for {}; waiting for a new key or header", f.rel);
+            }
+            return Err(error);
+        }
+        Ok(self.pool.get(&f.rel).and_then(|entry| entry.conn.as_ref()).expect("connection acquired"))
     }
 
     /// Is there an **open** connection for this rel? The sync layer uses this
@@ -234,6 +252,8 @@ impl LivePool {
     /// as changed but then fails to read it must leave the baseline alone.
     pub fn foreign_commit_pending(&self, rel: &str) -> Option<bool> {
         let entry = self.pool.get(rel)?;
+        // Never query a connection whose underlying encrypted file has been replaced.
+        if entry.salt != header_salt(&entry.path) { return Some(true); }
         let conn = entry.conn.as_ref()?;
         let now = LiveDb::read_data_version(conn).ok()?;
         Some(entry.data_version != Some(now))
