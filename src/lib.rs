@@ -108,7 +108,7 @@ pub fn run_cli() -> Result<()> {
             // serve 走老解析器：级别与格式来自 Config；输出**维持 stdout**（既有 `> 日志文件`
             // 部署的重定向习惯，理由见 logging 模块头「输出去向」）。
             let _ = logging::init_for_serve(&cfg.log, &cfg.log_format);
-            run(cfg)
+            run(*cfg)
         }
         // 子命令已经把活干完（token / 查询 / sync），或 --help/--version 已经打印过。
         cli::Entry::Done => Ok(()),

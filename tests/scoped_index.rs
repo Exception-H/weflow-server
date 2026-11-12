@@ -85,6 +85,7 @@ fn external_registration_refresh_makes_a_new_message_shard_visible() {
     let storage = common::build_wechat_account(&dir, &key.0);
     let mut mapping = std::collections::HashMap::new();
     mapping.insert("session/session.db".into(), common::FAKE_KEY_HEX.to_owned());
+    mapping.insert("contact/contact.db".into(), common::FAKE_KEY_HEX.to_owned());
     mapping.insert("message/message_0.db".into(), common::FAKE_KEY_HEX.to_owned());
     let keys = KeyMap::from_parts(None, Some(mapping.clone())).unwrap();
     let store = Arc::new(RwLock::new(Store::default()));

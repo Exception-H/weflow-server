@@ -210,7 +210,7 @@ struct Common {
 /// `pub(crate)` 而不是 `pub`：CLI 面不属于承诺面（嵌入者用不到 `Entry`），而承诺面每多
 /// 一个类型就多一份 semver 债。
 pub(crate) enum Entry {
-    Serve(Config),
+    Serve(Box<Config>),
     Done,
 }
 
@@ -371,7 +371,7 @@ pub(crate) fn dispatch() -> Result<Entry> {
 /// 裸跑（没有任何参数）的老入口。
 fn legacy_load() -> Result<Entry> {
     match crate::config::load()? {
-        Some(cfg) => Ok(Entry::Serve(cfg)),
+        Some(cfg) => Ok(Entry::Serve(Box::new(cfg))),
         // --help / --version：既有解析器已经打印过，这里只需退出 0。
         None => Ok(Entry::Done),
     }
@@ -380,7 +380,7 @@ fn legacy_load() -> Result<Entry> {
 /// 带旗标的老写法：把参数原样交给既有解析器，行为逐字不变。
 fn legacy(argv: &[String]) -> Result<Entry> {
     match crate::config::parse_args(argv.to_vec())? {
-        Some(cfg) => Ok(Entry::Serve(cfg)),
+        Some(cfg) => Ok(Entry::Serve(Box::new(cfg))),
         // --help / --version：既有解析器已经打印过，这里只需退出 0。
         None => Ok(Entry::Done),
     }
