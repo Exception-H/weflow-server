@@ -241,15 +241,34 @@ fn token_service() -> String {
     TOKEN_SERVICE.to_string()
 }
 
+fn read_fixed_token(path: &std::path::Path) -> Result<String> {
+    let value = std::fs::read_to_string(path)
+        .map_err(|_| anyhow::anyhow!("configured API token file cannot be read"))?;
+    let value = value.trim();
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("configured API token file must contain 64 hexadecimal characters");
+    }
+    Ok(value.to_owned())
+}
+
+fn configured_token() -> Result<Option<String>> {
+    match std::env::var_os("WEFLOW_SERVER_TOKEN_FILE") {
+        Some(path) => read_fixed_token(std::path::Path::new(&path)).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// Access token kept in the OS credential store (Windows Credential
 /// Manager / macOS Keychain / Linux Secret Service). Never written to a
-/// token file.
+/// token file by default. An explicit WEFLOW_SERVER_TOKEN_FILE uses an existing
+/// 64-hex credential file instead, and never logs or overwrites its contents.
 ///
 /// The token is printed to the log **only when it is first generated**
 /// (or when the credential store is unavailable and the token is
 /// per-session). On subsequent launches it is fetched silently; use the
 /// `--show-token` flag to retrieve it on demand.
 pub fn load_token() -> Result<String> {
+    if let Some(token) = configured_token()? { return Ok(token); }
     let entry = keyring::Entry::new(&token_service(), TOKEN_USER)
         .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
     match entry.get_password() {
@@ -285,6 +304,7 @@ pub fn load_token() -> Result<String> {
 /// Read the stored token without generating one; `None` when none exists.
 /// Used by `--show-token`.
 pub fn show_token() -> Result<Option<String>> {
+    if let Some(token) = configured_token()? { return Ok(Some(token)); }
     let entry = keyring::Entry::new(&token_service(), TOKEN_USER)
         .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
     match entry.get_password() {
@@ -308,6 +328,21 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fixed_token_file_rejects_missing_or_malformed_values_without_echoing_them() {
+        let dir = std::env::temp_dir().join(format!("weflow_fixed_token_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        assert!(read_fixed_token(&file).is_err());
+        std::fs::write(&file, "private-invalid-value").unwrap();
+        let error = read_fixed_token(&file).unwrap_err().to_string();
+        assert!(!error.contains("private-invalid-value"));
+        let value = hex::encode([0x42; 32]);
+        std::fs::write(&file, format!("{value}\n")).unwrap();
+        assert_eq!(read_fixed_token(&file).unwrap(), value);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

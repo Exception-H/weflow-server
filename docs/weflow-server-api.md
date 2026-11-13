@@ -1174,6 +1174,11 @@ timeline/export 的条目键：`tid/id/username/nickname/avatarUrl/createTime/co
 
 ## 启动示例
 
+Fork 服务可设置 `WEFLOW_SERVER_TOKEN_FILE` 指向已存在的私有凭证文件，内容为64位十六进制。
+服务与 `--show-token` 优先读取它，不生成、覆盖或记录该凭证；文件缺失/格式错误时明确失败，
+不回退系统凭据库或日志。这样重启操作系统后也不依赖内核keyring的生命周期。变量未设置时
+保留默认系统凭据库行为。该文件需由运维保管并限制权限，服务不自动向客户端同步凭证。
+
 ```powershell
 weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
 weflow-server.exe serve --port 5033      # 与上一行等价
