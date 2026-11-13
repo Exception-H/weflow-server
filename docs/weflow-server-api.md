@@ -1208,7 +1208,8 @@ weflow-server --watch-session GROUP_A@chatroom --watch-session GROUP_B@chatroom 
   群成员发言数及导出只覆盖当前保留窗口；`hasMore=false` 不代表源库历史全部读完。
   `since=0`、手动 sync、CLI/MCP 查询也不会绕过窗口。此模式不适合做全历史备份。
 - `--keys-file PATH` 必须为当前账号的注册 JSON（`wxid`、`db_path`、非空 `keys` 映射）；
-  必须与绑定账号和规范化数据目录相符。文件修订后只刷新该映射并关闭变更密钥的连接，
+  `db_path` 与原注册接口一致，可为账号根目录（含 `db_storage`）或 `db_storage` 本身，
+  规范化后必须与绑定账号数据目录相符。文件修订后只刷新该映射并关闭变更密钥的连接，
   保留消息水位；图片密钥不在热刷新范围，需要重新注册更新。无效修订保留原密钥，
   同一修订仅告警一次。服务不派生或持久化数据库密钥，也不读取微信进程。
 - 可选的 `scripts/refresh-registration-keys.py` 由外部运维运行，依赖 `sqlcipher3`；读取既有

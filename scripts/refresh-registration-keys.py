@@ -20,6 +20,8 @@ def refresh(registration, passphrase_file, headers):
     original = registration.read_bytes()
     config = json.loads(original)
     root = Path(config["db_path"]).resolve(strict=True)
+    if (root / "db_storage").is_dir():
+        root = (root / "db_storage").resolve(strict=True)
     passphrase = bytes.fromhex(passphrase_file.read_text().strip())
     changed = []
     pending = {}

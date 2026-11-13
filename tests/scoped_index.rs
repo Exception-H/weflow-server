@@ -104,7 +104,7 @@ fn external_registration_refresh_makes_a_new_message_shard_visible() {
     drop(connection);
     mapping.insert("message/message_1.db".into(), common::FAKE_KEY_HEX.to_owned());
     std::fs::write(&registration, serde_json::to_vec(&serde_json::json!({
-        "wxid": common::FAKE_WXID, "db_path": storage, "keys": mapping
+        "wxid": common::FAKE_WXID, "db_path": storage.parent().unwrap(), "keys": mapping
     })).unwrap()).unwrap();
     assert_eq!(sync.poll_once().unwrap().0, 1);
     assert!(store.read().convs[common::FAKE_GROUP].iter().any(|row| row.server_id == 99001));

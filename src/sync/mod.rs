@@ -297,7 +297,9 @@ impl AccountSync {
             }
             let source = value.get("db_path").and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("registration JSON requires db_path"))?;
-            if std::fs::canonicalize(source)? != std::fs::canonicalize(&self.storage)? {
+            let mut source = std::fs::canonicalize(source)?;
+            if source.join("db_storage").is_dir() { source = std::fs::canonicalize(source.join("db_storage"))?; }
+            if source != std::fs::canonicalize(&self.storage)? {
                 anyhow::bail!("external registration belongs to another storage directory");
             }
             let map = value.get("keys").ok_or_else(|| anyhow::anyhow!("registration JSON requires keys"))?;
