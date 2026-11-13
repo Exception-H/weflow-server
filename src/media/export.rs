@@ -14,6 +14,48 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::time::{Duration, Instant};
+use std::io::{Read, Write};
+
+/// Shared, cooperative deadline and cancellation for one export batch.
+#[derive(Clone)]
+pub struct ExportControl {
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+    entries: Arc<AtomicUsize>,
+}
+
+impl Default for ExportControl {
+    fn default() -> Self { Self::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(12)) }
+}
+
+impl ExportControl {
+    /// Bound one batch; the owner can cancel it while a client disconnects or the service stops.
+    pub fn new(cancelled: Arc<AtomicBool>, timeout: Duration) -> Self {
+        Self { deadline: Instant::now() + timeout, cancelled, entries: Arc::new(AtomicUsize::new(0)) }
+    }
+
+    /// Whether work may continue. Blocking filesystem syscalls themselves cannot be interrupted.
+    pub fn active(&self) -> bool {
+        !self.cancelled.load(Ordering::Relaxed) && Instant::now() < self.deadline
+    }
+
+    fn visit(&self) -> bool {
+        self.active() && self.entries.fetch_add(1, Ordering::Relaxed) < 20_000
+    }
+}
+
+const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > limit { return None; }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
 
 use rusqlite::Connection;
 
@@ -47,6 +89,8 @@ pub struct ExportCtx {
     /// Export destination root (`api-media/`).
     pub export_dir: PathBuf,
     pub media_keys: Option<ImageKeys>,
+    /// Per-batch deadline, traversal budget and cooperative cancellation.
+    pub control: ExportControl,
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +158,16 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
 
 /// Decode a wxgf (raw HEVC still) into PNG bytes via ffmpeg.
 pub fn wxgf_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    decode_wxgf(bytes, &ExportControl::default())
+}
+
+fn decode_wxgf(bytes: &[u8], control: &ExportControl) -> Option<Vec<u8>> {
+    if bytes.len() as u64 > MAX_IMAGE_BYTES || !control.active() { return None; }
     let ff = find_ffmpeg()?;
+    decode_with_program(bytes, control, &ff)
+}
+
+fn decode_with_program(bytes: &[u8], control: &ExportControl, ff: &Path) -> Option<Vec<u8>> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -122,20 +175,40 @@ pub fn wxgf_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
     let inp = std::env::temp_dir().join(format!("wfs_wxgf_{stamp}.hevc"));
     let outp = std::env::temp_dir().join(format!("wfs_wxgf_{stamp}.png"));
     std::fs::write(&inp, bytes).ok()?;
-    let res = std::process::Command::new(&ff)
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(&inp)
-        .args(["-frames:v", "1", "-f", "image2"])
-        .arg(&outp)
-        .output();
+    let result = (|| {
+        let mut child = std::process::Command::new(ff)
+            .args(["-nostdin", "-y", "-loglevel", "error", "-threads", "1", "-max_alloc", "67108864", "-i"])
+            .arg(&inp)
+            .args(["-frames:v", "1", "-fs", "67108864", "-f", "image2"])
+            .arg(&outp)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn().ok()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() { return None; }
+                    break;
+                }
+                Ok(None) if control.active() && Instant::now() < deadline &&
+                    std::fs::metadata(&outp).map_or(true, |meta| meta.len() <= MAX_DECODED_BYTES) => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!("[media-export] image decode cancelled, timed out or exceeded output budget");
+                    return None;
+                }
+            }
+        }
+        read_bounded(&outp, MAX_DECODED_BYTES)
+    })();
     let _ = std::fs::remove_file(&inp);
-    let out = res.ok()?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&outp);
-        return None;
-    }
-    let png = std::fs::read(&outp).ok()?;
     let _ = std::fs::remove_file(&outp);
+    let png = result?;
     if png.starts_with(&[0x89, b'P', b'N', b'G']) {
         Some(png)
     } else {
@@ -143,17 +216,20 @@ pub fn wxgf_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn walk_find(root: &Path, pattern: &str, depth: usize, out: &mut Vec<PathBuf>) {
-    if out.len() >= 4 || depth == 0 {
+fn walk_find(root: &Path, pattern: &str, depth: usize, out: &mut Vec<PathBuf>, control: &ExportControl) {
+    if out.len() >= 4 || depth == 0 || !control.active() {
         return;
     }
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for e in entries.flatten() {
+        if !control.visit() { return; }
         let p = e.path();
-        if p.is_dir() {
-            walk_find(&p, pattern, depth - 1, out);
+        let Ok(kind) = e.file_type() else { continue };
+        if kind.is_symlink() { continue; }
+        if kind.is_dir() {
+            walk_find(&p, pattern, depth - 1, out, control);
             if out.len() >= 4 {
                 return;
             }
@@ -283,9 +359,20 @@ fn write_out(
             digest_named,
         });
     }
-    let tmp = dir.join(format!(".{file_name}.tmp"));
-    std::fs::write(&tmp, bytes).ok()?;
-    std::fs::rename(&tmp, &path).ok()?;
+    // Concurrent requests may export the same image. Never share a writable temp inode.
+    let tmp = dir.join(format!(".{file_name}.{}.{:016x}.tmp", std::process::id(), rand::random::<u64>()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        // Windows may refuse replacing an already-published identical file.
+        if std::fs::read(&path).ok().as_deref() != Some(bytes) { return None; }
+    }
     Some(ExportedMedia {
         file_name: file_name.to_string(),
         kind_dir,
@@ -309,6 +396,7 @@ pub fn export_one(
     server_id: i64,
 ) -> Option<ExportedMedia> {
     use crate::parser::MediaKind as K;
+    if !ctx.control.active() { return None; }
     match kind {
         K::Image => {
             let img_md5 = md5?;
@@ -323,6 +411,9 @@ pub fn export_one(
                     stmt.query_row([img_md5], |r| r.get::<_, String>(0)).ok()
                 })
                 .unwrap_or_else(|| format!("{img_md5}.dat"));
+            if !crate::pathsafe::safe_segment(&resolved) || !name_is_content_digest(&format!("{img_md5}.dat")) {
+                return None;
+            }
             let session_md5 = format!("{:x}", {
                 use md5::Digest;
                 let mut h = md5::Md5::new();
@@ -334,6 +425,8 @@ pub fn export_one(
             let scoped = attach.join(&session_md5);
             if let Ok(months) = std::fs::read_dir(&scoped) {
                 for m in months.flatten() {
+                    if !ctx.control.visit() { return None; }
+                    if !m.file_type().ok()?.is_dir() { continue; }
                     let p = m.path().join("Img").join(&resolved);
                     if p.is_file() {
                         candidates.push(p);
@@ -341,13 +434,12 @@ pub fn export_one(
                 }
             }
             if candidates.is_empty() {
-                walk_find(&scoped, &resolved, 4, &mut candidates);
+                walk_find(&scoped, &resolved, 4, &mut candidates, &ctx.control);
             }
-            if candidates.is_empty() {
-                walk_find(&attach, &resolved, 4, &mut candidates);
-            }
+            // Never search unrelated conversations on a miss; their size must not affect this request.
             let src = candidates.first()?.clone();
-            let raw = std::fs::read(&src).ok()?;
+            if !ctx.control.active() { return None; }
+            let raw = read_bounded(&src, MAX_IMAGE_BYTES)?;
             let decoded = match media::detect_format(&raw) {
                 Some(fmt @ (DatFormat::V1 | DatFormat::V2)) => {
                     // V1 uses the fixed built-in key; V2 requires registered keys
@@ -400,7 +492,7 @@ pub fn export_one(
                 return None;
             }
             let (bytes, ext) = if decoded.starts_with(b"wxgf") {
-                match wxgf_to_png(&decoded) {
+                match decode_wxgf(&decoded, &ctx.control) {
                     Some(png) => (png, "png"),
                     None => {
                         // raw HEVC still: no common image decoder handles it, so
@@ -419,6 +511,7 @@ pub fn export_one(
                 let e = sniff_image_ext(&decoded);
                 (decoded, e)
             };
+            if !ctx.control.active() { return None; }
             // 图片的落盘名是 32 位摘要 + 嗅探出的扩展名 ⇒ 摘要派生。
             write_out(&ctx.export_dir, talker, "images", &format!("{img_md5}.{ext}"), &bytes, true)
         }
@@ -481,7 +574,7 @@ pub fn export_one(
             };
             let video_root = ctx.account_dir.join("msg").join("video");
             let mut hits = Vec::new();
-            walk_find(&video_root, &fname, 3, &mut hits);
+            walk_find(&video_root, &fname, 3, &mut hits, &ctx.control);
             let src = hits.first()?.clone();
             let bytes = std::fs::read(&src).ok()?;
             if bytes.starts_with(&media::MAGIC_V1) || bytes.starts_with(&media::MAGIC_V2) {
@@ -531,6 +624,7 @@ pub fn export_batch(
 ) -> HashMap<i64, ExportedMedia> {
     let mut out = HashMap::new();
     for (local_id, kind, md5, server_id, talker) in jobs.iter().take(max_items) {
+        if !ctx.control.active() { break; }
         if let Some(m) =
             export_one(ctx, aux, talker, *kind, md5.as_deref(), *server_id)
         {
@@ -558,10 +652,27 @@ pub fn export_batch_live(
     jobs: &[(i64, crate::parser::MediaKind, Option<String>, i64, String)],
     max_items: usize,
 ) -> HashMap<i64, ExportedMedia> {
+    export_batch_live_controlled(storage, keys, account_dir, export_dir, media_keys, _wxid, jobs, max_items, ExportControl::default())
+}
+
+/// Live batch with a caller-owned cancellation flag; use outside the index mutex.
+#[allow(clippy::too_many_arguments)]
+pub fn export_batch_live_controlled(
+    storage: &Path,
+    keys: &crate::keystore::KeyMap,
+    account_dir: &Path,
+    export_dir: &Path,
+    media_keys: Option<ImageKeys>,
+    _wxid: &str,
+    jobs: &[(i64, crate::parser::MediaKind, Option<String>, i64, String)],
+    max_items: usize,
+    control: ExportControl,
+) -> HashMap<i64, ExportedMedia> {
     let ctx = ExportCtx {
         account_dir: account_dir.to_path_buf(),
         export_dir: export_dir.to_path_buf(),
         media_keys,
+        control,
     };
     let files = crate::db::scan::enum_db_files(storage);
     let mut aux: HashMap<String, Connection> = HashMap::new();
@@ -600,6 +711,7 @@ pub fn export_batch_live(
     }
     let mut out = HashMap::new();
     for (local_id, kind, md5, server_id, talker) in jobs.iter().take(max_items) {
+        if !ctx.control.active() { break; }
         if let Some(m) =
             export_one(&ctx, &aux, talker, *kind, md5.as_deref(), *server_id)
         {
@@ -612,6 +724,71 @@ pub fn export_batch_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_search_does_not_visit_files_and_missing_image_stays_in_its_group() {
+        let root = std::env::temp_dir().join(format!("wfs_bounded_search_{}", std::process::id()));
+        let unrelated = root.join("msg/attach/unrelated/2026-01/Img");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let name = "aabbccddeeff00112233445566778899.dat";
+        std::fs::write(unrelated.join(name), [0xff, 0xd8, 0xff]).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let control = ExportControl::new(cancelled, Duration::from_secs(1));
+        let mut found = Vec::new();
+        walk_find(&root, name, 8, &mut found, &control);
+        assert!(found.is_empty());
+        assert_eq!(control.entries.load(Ordering::Relaxed), 0);
+        let ctx = ExportCtx { account_dir: root.clone(), export_dir: root.join("out"), media_keys: None, control: ExportControl::default() };
+        assert!(export_one(&ctx, &HashMap::new(), "selected@chatroom", crate::parser::MediaKind::Image,
+            Some("aabbccddeeff00112233445566778899"), 1).is_none());
+        assert_eq!(ctx.control.entries.load(Ordering::Relaxed), 0, "must not traverse another chat on a miss");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_exports_publish_complete_files_without_shared_temporaries() {
+        let root = std::env::temp_dir().join(format!("wfs_parallel_export_{}", std::process::id()));
+        let bytes = Arc::new(vec![0x5a; 512 * 1024]);
+        let handles: Vec<_> = (0..8).map(|_| {
+            let root = root.clone();
+            let bytes = bytes.clone();
+            std::thread::spawn(move || write_out(&root, "selected@chatroom", "images", "abc.png", &bytes, false).unwrap())
+        }).collect();
+        for handle in handles { handle.join().unwrap(); }
+        let dir = root.join("selected@chatroom/images");
+        assert_eq!(std::fs::read(dir.join("abc.png")).unwrap(), *bytes);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_walk_stops_at_its_entry_budget() {
+        let root = std::env::temp_dir().join(format!("wfs_walk_budget_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("present.dat"), b"test").unwrap();
+        let control = ExportControl::default();
+        control.entries.store(20_000, Ordering::Relaxed);
+        let mut found = Vec::new();
+        walk_find(&root, "present.dat", 4, &mut found, &control);
+        assert!(found.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_decoder_is_killed_and_reaped_on_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("wfs_slow_decode_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = root.join("decoder");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let control = ExportControl::new(Arc::new(AtomicBool::new(false)), Duration::from_millis(150));
+        let started = Instant::now();
+        assert!(decode_with_program(b"wxgf-test", &control, &fake).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// 导出媒体的对外地址必须是**根相对路径、且不含任何凭据**。
     ///

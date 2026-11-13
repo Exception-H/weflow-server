@@ -148,7 +148,11 @@ pub fn run(cfg: Config) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(cfg))
+    let result = rt.block_on(serve(cfg));
+    // Filesystem operations may be uninterruptible even after cooperative media cancellation.
+    // Do not let dropping the runtime wait forever for the blocking pool.
+    rt.shutdown_timeout(SHUTDOWN_GRACE);
+    result
 }
 
 /// How long a graceful shutdown may take before the process exits anyway.

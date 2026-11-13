@@ -144,6 +144,7 @@ let snap = dir.join("aux").join(common::FAKE_WXID);
         account_dir: account.clone(),
         export_dir: dir.join("api-media"),
         media_keys: Some(weflow_server::keystore::ImageKeys { aes: *weflow_server::media::V1_FIXED_AES_KEY, xor: 0 }),
+        control: Default::default(),
     };
     (ctx, aux)
 }

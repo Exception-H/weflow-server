@@ -785,6 +785,11 @@ impl AccountSync {
         Ok((applied_new, applied_revoke))
     }
 
+    /// Snapshot media credentials without holding the index mutex during filesystem work.
+    pub fn media_source(&self) -> (PathBuf, KeyMap, String) {
+        (self.storage.clone(), self.keys.clone(), self.wxid.clone())
+    }
+
     /// Run the media export batch against this account.
     ///
     /// Auxiliary databases (`hardlink`, `media_*`, `emoticon`) are opened

@@ -261,6 +261,8 @@ pub struct AppState {
     /// [`AppState::set_discovered`].
     pub discovered: Mutex<Vec<AccountInfo>>,
     pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// Bound concurrently running blocking media batches.
+    pub media_slots: Arc<tokio::sync::Semaphore>,
     /// 进程级事件总线（qqflow-server 同构）：重放历史 ＋ 广播通道，**绑成一件**。
     /// 全局而非每账号：`/api/v1/push/messages` 无需 ready 账号即可订阅（客户端在启动时
     /// 连接、账号建好索引后开始收事件），替换 `error` 账号也不会让在线订阅者失联。
@@ -288,6 +290,7 @@ impl AppState {
             accounts: Mutex::new(HashMap::new()),
             discovered: Mutex::new(Vec::new()),
             shutdown,
+            media_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             bus: EventBus::new(Self::EVENT_BUS_CAPACITY),
         }
     }

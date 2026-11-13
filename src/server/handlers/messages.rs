@@ -196,17 +196,39 @@ pub(crate) async fn run_export_batch(
     let export_dir = state.cfg.media_export_dir.clone();
     let mk = account.media_keys;
     let sync = account.sync.clone();
-    tokio::task::spawn_blocking(move || {
-        sync.lock().export_media_batch(
-            &account_dir,
-            mk,
-            std::path::Path::new(&export_dir),
-            &jobs,
-            200,
+    let mut shutdown = state.shutdown.subscribe();
+    if *shutdown.borrow() { return HashMap::new(); }
+    let slots = state.media_slots.clone();
+    let permit = tokio::select! {
+        permit = slots.acquire_owned() => match permit { Ok(permit) => permit, Err(_) => return HashMap::new() },
+        _ = shutdown.changed() => return HashMap::new(),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => return HashMap::new(),
+    };
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Relaxed); }
+    }
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    let control = crate::media::export::ExportControl::new(cancelled, std::time::Duration::from_secs(12));
+    let mut job = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let source = loop {
+            if !control.active() { return HashMap::new(); }
+            if let Some(guard) = sync.try_lock_for(std::time::Duration::from_millis(50)) {
+                break guard.media_source();
+            }
+        };
+        crate::media::export::export_batch_live_controlled(
+            &source.0, &source.1, &account_dir, &export_dir, mk, &source.2, &jobs, 200, control,
         )
-    })
-    .await
-    .unwrap_or_default()
+    });
+    if *shutdown.borrow() { return HashMap::new(); }
+    tokio::select! {
+        result = &mut job => result.unwrap_or_default(),
+        _ = shutdown.changed() => HashMap::new(),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(13)) => HashMap::new(),
+    }
 }
 
 fn message_dto(store: &Store, m: &crate::store::MessageRecord) -> MessageNative {
